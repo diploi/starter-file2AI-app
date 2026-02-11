@@ -15,15 +15,44 @@ interface Message {
   files?: string[];
 }
 
+function getSessionId(): string {
+  let id = sessionStorage.getItem('ws_session_id');
+  if (!id) {
+    id = crypto.randomUUID();
+    sessionStorage.setItem('ws_session_id', id);
+  }
+  return id;
+}
+
+function loadMessages(storageKey: string): Message[] {
+  try {
+    const saved = localStorage.getItem(storageKey);
+    if (saved) {
+      const parsed: Message[] = JSON.parse(saved, (key, value) =>
+        key === 'timestamp' ? new Date(value) : value
+      );
+      // Filter out stale processing messages from a previous session
+      return parsed.filter(m => m.type !== 'processing');
+    }
+  } catch {
+    // Corrupted data, start fresh
+  }
+  return [];
+}
+
 export const FileUploader: React.FC = () => {
+  const sessionIdRef = useRef<string>(getSessionId());
+  const storageKey = `messages_${sessionIdRef.current}`;
+
   const [attachedFile, setAttachedFile] = useState<UploadedFile | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [prompt, setPrompt] = useState('');
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messages, setMessages] = useState<Message[]>(() => loadMessages(storageKey));
   const [isProcessing, setIsProcessing] = useState(false);
   const [ws, setWs] = useState<WebSocket | null>(null);
   const [isRecordingAudio, setIsRecordingAudio] = useState(false);
   const [isRecordingVideo, setIsRecordingVideo] = useState(false);
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -31,73 +60,72 @@ export const FileUploader: React.FC = () => {
   const videoPreviewRef = useRef<HTMLVideoElement>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
 
-  let restartCount = 0;
-  // WebSocket connection
+  // WebSocket connection with reconnection
   useEffect(() => {
-    const wsUrl = 'wss://my-dev-2--file2ai-yk98.diploi.me/ws';
-    restartCount++;
+    let websocket: WebSocket | null = null;
+    let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+    let shouldReconnect = true;
 
-    const websocket = new WebSocket(wsUrl);
+    const connect = () => {
+      const wsUrl = `wss://my-dev-2--file2ai-yk98.diploi.me/ws?session_id=${sessionIdRef.current}`;
+      websocket = new WebSocket(wsUrl);
 
-    websocket.onopen = () => {
-      console.log('WebSocket connected');
-      console.log('Restart count: ' + restartCount);
+      websocket.onopen = () => {
+        console.log('WebSocket connected, session:', sessionIdRef.current);
+      };
+
+      websocket.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+
+        if (data.type === 'response') {
+          setMessages(prev => prev.filter(m => m.type !== 'processing'));
+          setMessages(prev => [...prev, {
+            id: Date.now().toString(),
+            type: 'assistant',
+            content: data.content,
+            timestamp: new Date(),
+          }]);
+          setIsProcessing(false);
+        } else if (data.type === 'error') {
+          setMessages(prev => prev.filter(m => m.type !== 'processing'));
+          setMessages(prev => [...prev, {
+            id: Date.now().toString(),
+            type: 'error',
+            content: data.content,
+            timestamp: new Date(),
+          }]);
+          setIsProcessing(false);
+        }
+      };
+
+      websocket.onerror = (error) => {
+        console.error('WebSocket error:', error);
+      };
+
+      websocket.onclose = () => {
+        console.log('WebSocket disconnected');
+        if (shouldReconnect) {
+          console.log('Reconnecting in 2 seconds...');
+          reconnectTimeout = setTimeout(connect, 2000);
+        }
+      };
+
+      setWs(websocket);
     };
 
-    websocket.onmessage = (event) => {
-      console.log(event);
-      console.log('MESSAGE RECEIVED');
-      const data = JSON.parse(event.data);
-
-      if (data.type === 'response') {
-        console.log('RESPONSE RECEIVED');
-        setMessages(prev => prev.filter(m => m.type !== 'processing'));
-        setMessages(prev => [...prev, {
-          id: Date.now().toString(),
-          type: 'assistant',
-          content: data.content,
-          timestamp: new Date(),
-        }]);
-        setIsProcessing(false);
-      } else if (data.type === 'error') {
-        setMessages(prev => prev.filter(m => m.type !== 'processing'));
-        setMessages(prev => [...prev, {
-          id: Date.now().toString(),
-          type: 'error',
-          content: data.content,
-          timestamp: new Date(),
-        }]);
-        setIsProcessing(false);
-      } else if (data.type === 'processing') {
-        console.log('Processing:', data.content);
-      }
-    };
-
-    websocket.onerror = (error) => {
-      console.error('WebSocket error:', error);
-      setMessages(prev => prev.filter(m => m.type !== 'processing'));
-      setMessages(prev => [...prev, {
-        id: Date.now().toString(),
-        type: 'error',
-        content: 'Connection error. Please try again.',
-        timestamp: new Date(),
-      }]);
-      setIsProcessing(false);
-    };
-
-    websocket.onclose = () => {
-      console.log('WebSocket disconnected');
-    };
-
-    setWs(websocket);
-    console.log("THIS RAN OUTSIDE OF CLEANUP FUNCTION");
+    connect();
 
     return () => {
-      console.log("CLEANUP RUNNING");
-      console.log('Restart count after cleanup: ' + restartCount);
-      websocket.close();
+      shouldReconnect = false;
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      websocket?.close();
     };
   }, []);
+
+  // Persist messages to localStorage
+  useEffect(() => {
+    localStorage.setItem(storageKey, JSON.stringify(messages));
+  }, [messages, storageKey]);
 
   // Auto-scroll to bottom of messages
   useEffect(() => {
@@ -117,6 +145,14 @@ export const FileUploader: React.FC = () => {
     }
 
     setAttachedFile(uploadedFile);
+
+    // Prefill prompt based on file type (only if prompt is empty)
+    setPrompt(prev => {
+      if (prev.trim() === '') {
+        return getDefaultPrompt(file.type);
+      }
+      return prev;
+    });
   }, []);
 
   const handleFiles = (fileList: FileList | null) => {
@@ -250,6 +286,38 @@ export const FileUploader: React.FC = () => {
     }
   }, [attachFile, stopMediaStream]);
 
+  const copyMessage = async (messageId: string, content: string) => {
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopiedMessageId(messageId);
+      setTimeout(() => setCopiedMessageId(null), 2000);
+    } catch {
+      // Fallback for older browsers
+      const textarea = document.createElement('textarea');
+      textarea.value = content;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      setCopiedMessageId(messageId);
+      setTimeout(() => setCopiedMessageId(null), 2000);
+    }
+  };
+
+  const getDefaultPrompt = (fileType: string): string => {
+    if (fileType.startsWith('audio/')) {
+      return 'Transcribe this audio to plain text. Output only the transcription, nothing else.';
+    }
+    if (fileType.startsWith('video/')) {
+      return 'Transcribe the audio from this video to plain text. Output only the transcription, nothing else.';
+    }
+    if (fileType.startsWith('image/')) {
+      return 'Extract all text from this image to plain text. Output only the transcription, nothing else.';
+    }
+    // Text and other files
+    return 'Extract the text content from this file. Output only the extracted text, nothing else.';
+  };
+
   const formatFileSize = (bytes: number): string => {
     if (bytes === 0) return '0 Bytes';
     const k = 1024;
@@ -285,6 +353,7 @@ export const FileUploader: React.FC = () => {
     try {
       const formData = new FormData();
       formData.append('prompt', prompt);
+      formData.append('session_id', sessionIdRef.current);
 
       if (attachedFile) {
         formData.append('files', attachedFile.file);
@@ -336,7 +405,10 @@ export const FileUploader: React.FC = () => {
             <h4>Conversation</h4>
             <button
               className="clear-messages-button"
-              onClick={() => setMessages([])}
+              onClick={() => {
+                setMessages([]);
+                localStorage.removeItem(storageKey);
+              }}
             >
               Clear
             </button>
@@ -364,6 +436,26 @@ export const FileUploader: React.FC = () => {
                     </>
                   )}
                 </div>
+                {message.type !== 'processing' && (
+                  <div className="message-actions">
+                    <button
+                      className="copy-message-button"
+                      onClick={() => copyMessage(message.id, message.content)}
+                      title="Copy message"
+                    >
+                      {copiedMessageId === message.id ? (
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" className="copy-icon">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                        </svg>
+                      ) : (
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" className="copy-icon">
+                          <rect x="9" y="9" width="13" height="13" rx="2" ry="2" strokeWidth={2} />
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
+                        </svg>
+                      )}
+                    </button>
+                  </div>
+                )}
                 <div className="message-time">
                   {formatTime(message.timestamp)}
                 </div>

@@ -142,10 +142,41 @@
   border-bottom-color: rgba(0, 0, 0, 0.1);
 }
 
+.message-actions {
+  display: flex;
+  padding: 0.2rem 0.5rem 0;
+}
+
+.message-user .message-actions {
+  justify-content: flex-end;
+}
+
+.copy-message-button {
+  background: none;
+  border: none;
+  padding: 0.2rem;
+  cursor: pointer;
+  color: #94a3b8;
+  border-radius: 4px;
+  transition: all 0.15s ease;
+  display: flex;
+  align-items: center;
+}
+
+.copy-message-button:hover {
+  color: #475569;
+  background: rgba(0, 0, 0, 0.05);
+}
+
+.copy-icon {
+  width: 14px;
+  height: 14px;
+}
+
 .message-time {
   font-size: 0.75rem;
   color: #94a3b8;
-  margin-top: 0.25rem;
+  margin-top: 0.1rem;
   padding: 0 0.5rem;
 }
 

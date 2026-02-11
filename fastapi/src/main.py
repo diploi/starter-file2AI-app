@@ -1,7 +1,7 @@
 from fastapi.responses import HTMLResponse
 from fastapi import FastAPI, File, UploadFile, Form, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional
+from typing import Dict, List, Optional
 import asyncio
 import json
 import os
@@ -24,20 +24,30 @@ app.add_middleware(
 # WebSocket connection manager
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: List[WebSocket] = []
+        self.active_connections: Dict[str, WebSocket] = {}
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, session_id: str, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections.append(websocket)
+        # Replace stale connection for the same session (e.g. page refresh)
+        old = self.active_connections.get(session_id)
+        if old:
+            try:
+                await old.close()
+            except Exception:
+                pass
+        self.active_connections[session_id] = websocket
 
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+    def disconnect(self, session_id: str):
+        self.active_connections.pop(session_id, None)
+
+    def get_connection(self, session_id: str) -> Optional[WebSocket]:
+        return self.active_connections.get(session_id)
 
     async def send_personal_message(self, message: dict, websocket: WebSocket):
         await websocket.send_text(json.dumps(message))
 
     async def broadcast(self, message: dict):
-        for connection in self.active_connections:
+        for connection in self.active_connections.values():
             await connection.send_text(json.dumps(message))
 
 manager = ConnectionManager()
@@ -45,19 +55,19 @@ manager = ConnectionManager()
 # Initialize OpenAI client
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Store active processing tasks
-processing_tasks = {}
-
-
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
+async def websocket_endpoint(websocket: WebSocket, session_id: str = ""):
+    if not session_id:
+        await websocket.close(code=4000, reason="session_id query parameter required")
+        return
+
+    await manager.connect(session_id, websocket)
     try:
         while True:
             data = await websocket.receive_text()
             await websocket.send_text(json.dumps({"type": "pong"}))
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        manager.disconnect(session_id)
 
 async def transcribe_audio(audio_bytes: bytes, filename: str, content_type: str) -> str:
     """Transcribe audio bytes using OpenAI Whisper API."""
@@ -137,6 +147,7 @@ def extract_video_frames(video_bytes: bytes, content_type: str, max_frames: int 
 
 async def extract_video_audio(video_bytes: bytes, content_type: str) -> Optional[bytes]:
     """Extract audio track from a video file using ffmpeg."""
+    print(f'CONTENT TYPE {content_type}')
     ext_map = {"video/webm": ".webm", "video/mp4": ".mp4", "video/quicktime": ".mov"}
     ext = ext_map.get(content_type, ".webm")
 
@@ -162,8 +173,6 @@ async def extract_video_audio(video_bytes: bytes, content_type: str) -> Optional
 async def process_with_openai(prompt: str, files: List[UploadFile], websocket: WebSocket):
     print('FILES BEING REVIEWED <<<<<<<<<<<<<<')
     print('PARAMS RECEIVED <<<<<<<<<<<<<<')
-    print(prompt)
-    print(files)
     try:
         print('TRY CATCH BLOCK RUNNING>>>>>>>>>>>>>>>>>>>>>>.')
         # Send processing status
@@ -219,6 +228,7 @@ async def process_with_openai(prompt: str, files: List[UploadFile], websocket: W
                     })
 
             elif content_type.startswith('video/'):
+                print('VIDEO RECEIVED')
                 # Video: extract frames as images + transcribe audio track
                 await manager.send_personal_message({
                     "type": "processing",
@@ -226,35 +236,37 @@ async def process_with_openai(prompt: str, files: List[UploadFile], websocket: W
                 }, websocket)
 
                 # Extract and attach frames
-                try:
-                    frames = extract_video_frames(content, content_type)
-                    if frames:
-                        messages[0]["content"].append({
-                            "type": "text",
-                            "text": f"\n\n[Frames extracted from video: {filename} ({len(frames)} frames)]"
-                        })
-                        for frame_bytes in frames:
-                            base64_frame = base64.b64encode(frame_bytes).decode('utf-8')
-                            messages[0]["content"].append({
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{base64_frame}"
-                                }
-                            })
-                    else:
-                        messages[0]["content"].append({
-                            "type": "text",
-                            "text": f"\n\n[Video: {filename} — could not extract frames]"
-                        })
-                except Exception as e:
-                    print(f"Frame extraction failed: {e}")
-                    messages[0]["content"].append({
-                        "type": "text",
-                        "text": f"\n\n[Video: {filename} — frame extraction failed: {str(e)}]"
-                    })
+                # try:
+                #     frames = extract_video_frames(content, content_type)
+                #     if frames:
+                #         messages[0]["content"].append({
+                #             "type": "text",
+                #             "text": f"\n\n[Frames extracted from video: {filename} ({len(frames)} frames)]"
+                #         })
+                #         for frame_bytes in frames:
+                #             base64_frame = base64.b64encode(frame_bytes).decode('utf-8')
+                #             messages[0]["content"].append({
+                #                 "type": "image_url",
+                #                 "image_url": {
+                #                     "url": f"data:image/jpeg;base64,{base64_frame}"
+                #                 }
+                #             })
+                #     else:
+                #         messages[0]["content"].append({
+                #             "type": "text",
+                #             "text": f"\n\n[Video: {filename} — could not extract frames]"
+                #         })
+                # except Exception as e:
+                #     print(f"Frame extraction failed: {e}")
+                #     messages[0]["content"].append({
+                #         "type": "text",
+                #         "text": f"\n\n[Video: {filename} — frame extraction failed: {str(e)}]"
+                #     })
 
                 # Extract and transcribe audio track
                 try:
+                    print('EXTRACTING AUDIO')
+                    print(f'CONTENT TYPE RECEIVED BEFORE EXTRACTION {content_type}')
                     audio_bytes = await extract_video_audio(content, content_type)
                     if audio_bytes:
                         transcript = await transcribe_audio(audio_bytes, filename, "audio/mpeg")
@@ -308,18 +320,23 @@ async def process_with_openai(prompt: str, files: List[UploadFile], websocket: W
 @app.post("/api/process")
 async def process_files(
     prompt: str = Form(...),
+    session_id: str = Form(...),
     files: List[UploadFile] = File(default=[])
 ):
     """
-    Endpoint to receive files and prompt, then process with OpenAI
+    Endpoint to receive files and prompt, then process with OpenAI.
+    session_id correlates this request with the correct WebSocket connection.
     """
-    print('Files received')
-    print(files)
     if not prompt and not files:
         raise HTTPException(status_code=400, detail="Prompt or files required")
 
-    # Get the WebSocket connection (in a real scenario, you'd need to associate this with a session)
-    # For now, we'll broadcast to all connections
+    websocket = manager.get_connection(session_id)
+    if not websocket:
+        raise HTTPException(
+            status_code=400,
+            detail="No WebSocket connection found for this session. Please refresh and try again."
+        )
+
     file_data = []
     for file in files:
         content = await file.read()
@@ -329,12 +346,8 @@ async def process_files(
             "content": content
         })
 
-    if manager.active_connections:
-        websocket = manager.active_connections[0]
-        asyncio.create_task(process_with_openai(prompt, file_data, websocket))
-        return {"status": "processing", "message": "Request received"}
-    else:
-        raise HTTPException(status_code=400, detail="No WebSocket connection available")
+    asyncio.create_task(process_with_openai(prompt, file_data, websocket))
+    return {"status": "processing", "message": "Request received"}
 
 
 @app.get("/", response_class=HTMLResponse)
