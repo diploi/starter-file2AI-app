@@ -1,136 +1,34 @@
-import React, { useState, useRef, DragEvent, ChangeEvent, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useCallback } from 'react';
 import './FileUploader.css';
-
-interface UploadedFile {
-  file: File;
-  preview?: string;
-  id: string;
-}
-
-interface Message {
-  id: string;
-  type: 'user' | 'assistant' | 'error' | 'processing';
-  content: string;
-  timestamp: Date;
-  files?: string[];
-}
-
-function getSessionId(): string {
-  let id = sessionStorage.getItem('ws_session_id');
-  if (!id) {
-    id = crypto.randomUUID();
-    sessionStorage.setItem('ws_session_id', id);
-  }
-  return id;
-}
-
-function loadMessages(storageKey: string): Message[] {
-  try {
-    const saved = localStorage.getItem(storageKey);
-    if (saved) {
-      const parsed: Message[] = JSON.parse(saved, (key, value) =>
-        key === 'timestamp' ? new Date(value) : value
-      );
-      // Filter out stale processing messages from a previous session
-      return parsed.filter(m => m.type !== 'processing');
-    }
-  } catch {
-    // Corrupted data, start fresh
-  }
-  return [];
-}
+import { UploadedFile } from '../types';
+import { getSessionId, getDefaultPrompt } from '../utils';
+import { useWebSocket } from '../hooks/useWebSocket';
+import { useMediaRecorder } from '../hooks/useMediaRecorder';
+import { MessageList } from './MessageList';
+import { PromptInput } from './PromptInput';
+import { MediaControls } from './MediaControls';
+import { FileDropzone } from './FileDropzone';
+import { AttachedFileCard } from './AttachedFileCard';
 
 export const FileUploader: React.FC = () => {
   const sessionIdRef = useRef<string>(getSessionId());
   const storageKey = `messages_${sessionIdRef.current}`;
 
   const [attachedFile, setAttachedFile] = useState<UploadedFile | null>(null);
-  const [isDragging, setIsDragging] = useState(false);
   const [prompt, setPrompt] = useState('');
-  const [messages, setMessages] = useState<Message[]>(() => loadMessages(storageKey));
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [ws, setWs] = useState<WebSocket | null>(null);
-  const [isRecordingAudio, setIsRecordingAudio] = useState(false);
-  const [isRecordingVideo, setIsRecordingVideo] = useState(false);
-  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const mediaChunksRef = useRef<Blob[]>([]);
-  const videoPreviewRef = useRef<HTMLVideoElement>(null);
-  const mediaStreamRef = useRef<MediaStream | null>(null);
 
-  // WebSocket connection with reconnection
-  useEffect(() => {
-    let websocket: WebSocket | null = null;
-    let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
-    let shouldReconnect = true;
-
-    const connect = () => {
-      const wsUrl = `wss://api--file2ai.diploi.me/ws?session_id=${sessionIdRef.current}`;
-      websocket = new WebSocket(wsUrl);
-
-      websocket.onopen = () => {
-        console.log('WebSocket connected, session:', sessionIdRef.current);
-      };
-
-      websocket.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-
-        if (data.type === 'response') {
-          setMessages(prev => prev.filter(m => m.type !== 'processing'));
-          setMessages(prev => [...prev, {
-            id: Date.now().toString(),
-            type: 'assistant',
-            content: data.content,
-            timestamp: new Date(),
-          }]);
-          setIsProcessing(false);
-        } else if (data.type === 'error') {
-          setMessages(prev => prev.filter(m => m.type !== 'processing'));
-          setMessages(prev => [...prev, {
-            id: Date.now().toString(),
-            type: 'error',
-            content: data.content,
-            timestamp: new Date(),
-          }]);
-          setIsProcessing(false);
-        }
-      };
-
-      websocket.onerror = (error) => {
-        console.error('WebSocket error:', error);
-      };
-
-      websocket.onclose = () => {
-        console.log('WebSocket disconnected');
-        if (shouldReconnect) {
-          console.log('Reconnecting in 2 seconds...');
-          reconnectTimeout = setTimeout(connect, 2000);
-        }
-      };
-
-      setWs(websocket);
-    };
-
-    connect();
-
-    return () => {
-      shouldReconnect = false;
-      if (reconnectTimeout) clearTimeout(reconnectTimeout);
-      websocket?.close();
-    };
-  }, []);
-
-  // Persist messages to localStorage
-  useEffect(() => {
-    localStorage.setItem(storageKey, JSON.stringify(messages));
-  }, [messages, storageKey]);
-
-  // Auto-scroll to bottom of messages
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  const {
+    messages,
+    isProcessing,
+    copiedMessageId,
+    addUserMessage,
+    addProcessingMessage,
+    addErrorMessage,
+    clearMessages,
+    setIsProcessing,
+    copyMessage,
+    messagesEndRef,
+  } = useWebSocket(sessionIdRef.current, storageKey);
 
   const attachFile = useCallback((file: File) => {
     const uploadedFile: UploadedFile = {
@@ -138,15 +36,12 @@ export const FileUploader: React.FC = () => {
       id: `${file.name}-${Date.now()}-${Math.random()}`,
     };
 
-    // Create preview for images, audio, and video
     if (file.type.startsWith('image/') || file.type.startsWith('audio/') || file.type.startsWith('video/')) {
-      const url = URL.createObjectURL(file);
-      uploadedFile.preview = url;
+      uploadedFile.preview = URL.createObjectURL(file);
     }
 
     setAttachedFile(uploadedFile);
 
-    // Prefill prompt based on file type (only if prompt is empty)
     setPrompt(prev => {
       if (prev.trim() === '') {
         return getDefaultPrompt(file.type);
@@ -155,176 +50,28 @@ export const FileUploader: React.FC = () => {
     });
   }, []);
 
-  const handleFiles = (fileList: FileList | null) => {
-    if (!fileList || fileList.length === 0) return;
-    attachFile(fileList[0]);
-  };
+  const {
+    isRecordingAudio,
+    isRecordingVideo,
+    isRecording,
+    videoPreviewRef,
+    startAudioRecording,
+    startVideoRecording,
+    stopRecording,
+  } = useMediaRecorder(attachFile);
 
-  const handleDragEnter = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(true);
-  };
-
-  const handleDragLeave = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(false);
-  };
-
-  const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-  };
-
-  const handleDrop = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(false);
-    const droppedFiles = e.dataTransfer.files;
-    handleFiles(droppedFiles);
-  };
-
-  const handleFileInputChange = (e: ChangeEvent<HTMLInputElement>) => {
-    handleFiles(e.target.files);
-    // Reset input so the same file can be re-selected
-    if (fileInputRef.current) fileInputRef.current.value = '';
-  };
-
-  const handleClick = () => {
-    fileInputRef.current?.click();
-  };
-
-  const removeFile = () => {
+  const removeFile = useCallback(() => {
     if (attachedFile?.preview) {
       URL.revokeObjectURL(attachedFile.preview);
     }
     setAttachedFile(null);
-  };
+  }, [attachedFile]);
 
-  const stopMediaStream = useCallback(() => {
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach(track => track.stop());
-      mediaStreamRef.current = null;
+  const handleFilesSelected = useCallback((fileList: FileList | null) => {
+    if (fileList && fileList.length > 0) {
+      attachFile(fileList[0]);
     }
-    if (videoPreviewRef.current) {
-      videoPreviewRef.current.srcObject = null;
-    }
-  }, []);
-
-  const stopRecording = useCallback(() => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
-    }
-  }, []);
-
-  const startAudioRecording = useCallback(async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      mediaStreamRef.current = stream;
-      mediaChunksRef.current = [];
-
-      const recorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = recorder;
-
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) {
-          mediaChunksRef.current.push(e.data);
-        }
-      };
-
-      recorder.onstop = () => {
-        const blob = new Blob(mediaChunksRef.current, { type: 'audio/webm' });
-        const file = new File([blob], `audio-recording-${Date.now()}.webm`, { type: 'audio/webm' });
-        attachFile(file);
-        stopMediaStream();
-        setIsRecordingAudio(false);
-      };
-
-      recorder.start();
-      setIsRecordingAudio(true);
-    } catch (err) {
-      console.error('Failed to start audio recording:', err);
-      alert('Could not access microphone. Please check permissions.');
-    }
-  }, [attachFile, stopMediaStream]);
-
-  const startVideoRecording = useCallback(async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-      mediaStreamRef.current = stream;
-      mediaChunksRef.current = [];
-
-      // Show live preview
-      if (videoPreviewRef.current) {
-        videoPreviewRef.current.srcObject = stream;
-        videoPreviewRef.current.play();
-      }
-
-      const recorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = recorder;
-
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) {
-          mediaChunksRef.current.push(e.data);
-        }
-      };
-
-      recorder.onstop = () => {
-        const blob = new Blob(mediaChunksRef.current, { type: 'video/webm' });
-        const file = new File([blob], `video-recording-${Date.now()}.webm`, { type: 'video/webm' });
-        attachFile(file);
-        stopMediaStream();
-        setIsRecordingVideo(false);
-      };
-
-      recorder.start();
-      setIsRecordingVideo(true);
-    } catch (err) {
-      console.error('Failed to start video recording:', err);
-      alert('Could not access camera/microphone. Please check permissions.');
-    }
-  }, [attachFile, stopMediaStream]);
-
-  const copyMessage = async (messageId: string, content: string) => {
-    try {
-      await navigator.clipboard.writeText(content);
-      setCopiedMessageId(messageId);
-      setTimeout(() => setCopiedMessageId(null), 2000);
-    } catch {
-      // Fallback for older browsers
-      const textarea = document.createElement('textarea');
-      textarea.value = content;
-      document.body.appendChild(textarea);
-      textarea.select();
-      document.execCommand('copy');
-      document.body.removeChild(textarea);
-      setCopiedMessageId(messageId);
-      setTimeout(() => setCopiedMessageId(null), 2000);
-    }
-  };
-
-  const getDefaultPrompt = (fileType: string): string => {
-    if (fileType.startsWith('audio/')) {
-      return 'Transcribe this audio to plain text. Output only the transcription, nothing else.';
-    }
-    if (fileType.startsWith('video/')) {
-      return 'Transcribe the audio from this video to plain text. Output only the transcription, nothing else.';
-    }
-    if (fileType.startsWith('image/')) {
-      return 'Extract all text from this image to plain text. Output only the transcription, nothing else.';
-    }
-    // Text and other files
-    return 'Extract the text content from this file. Output only the extracted text, nothing else.';
-  };
-
-  const formatFileSize = (bytes: number): string => {
-    if (bytes === 0) return '0 Bytes';
-    const k = 1024;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
-  };
+  }, [attachFile]);
 
   const handleUpload = async () => {
     if (!prompt.trim() && !attachedFile) {
@@ -335,20 +82,8 @@ export const FileUploader: React.FC = () => {
     setIsProcessing(true);
 
     const fileName = attachedFile ? attachedFile.file.name : undefined;
-    setMessages(prev => [...prev, {
-      id: Date.now().toString(),
-      type: 'user',
-      content: prompt,
-      timestamp: new Date(),
-      files: fileName ? [fileName] : undefined,
-    }]);
-
-    setMessages(prev => [...prev, {
-      id: `processing-${Date.now()}`,
-      type: 'processing',
-      content: 'Processing your request...',
-      timestamp: new Date(),
-    }]);
+    addUserMessage(prompt, fileName ? [fileName] : undefined);
+    addProcessingMessage();
 
     try {
       const formData = new FormData();
@@ -358,10 +93,6 @@ export const FileUploader: React.FC = () => {
       if (attachedFile) {
         formData.append('files', attachedFile.file);
       }
-
-      console.log('FORMDATA TO SEND');
-      console.log(formData.get('prompt'));
-      console.log(formData.get('files'));
 
       const response = await fetch('https://api--file2ai.diploi.me/api/process', {
         method: 'POST',
@@ -376,244 +107,52 @@ export const FileUploader: React.FC = () => {
       removeFile();
     } catch (error) {
       console.error('Upload error:', error);
-      setMessages(prev => prev.filter(m => m.type !== 'processing'));
-      setMessages(prev => [...prev, {
-        id: Date.now().toString(),
-        type: 'error',
-        content: `Error: ${error instanceof Error ? error.message : 'Upload failed'}`,
-        timestamp: new Date(),
-      }]);
+      addErrorMessage(`Error: ${error instanceof Error ? error.message : 'Upload failed'}`);
       setIsProcessing(false);
     }
   };
 
-  const formatTime = (date: Date): string => {
-    return date.toLocaleTimeString('en-US', {
-      hour: '2-digit',
-      minute: '2-digit'
-    });
-  };
-
-  const isRecording = isRecordingAudio || isRecordingVideo;
-
   return (
     <div className="file-uploader-container">
-      {/* Messages Section */}
-      {messages.length > 0 && (
-        <div className="messages-section">
-          <div className="messages-header">
-            <h4>Conversation</h4>
-            <button
-              className="clear-messages-button"
-              onClick={() => {
-                setMessages([]);
-                localStorage.removeItem(storageKey);
-              }}
-            >
-              Clear
-            </button>
-          </div>
-          <div className="messages-list">
-            {messages.map((message) => (
-              <div
-                key={message.id}
-                className={`message message-${message.type}`}
-              >
-                <div className="message-content">
-                  {message.type === 'processing' ? (
-                    <div className="processing-indicator">
-                      <div className="spinner"></div>
-                      <span>{message.content}</span>
-                    </div>
-                  ) : (
-                    <>
-                      {message.files && message.files.length > 0 && (
-                        <div className="message-files">
-                          {message.files.join(', ')}
-                        </div>
-                      )}
-                      <p>{message.content}</p>
-                    </>
-                  )}
-                </div>
-                {message.type !== 'processing' && (
-                  <div className="message-actions">
-                    <button
-                      className="copy-message-button"
-                      onClick={() => copyMessage(message.id, message.content)}
-                      title="Copy message"
-                    >
-                      {copiedMessageId === message.id ? (
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" className="copy-icon">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-                        </svg>
-                      ) : (
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" className="copy-icon">
-                          <rect x="9" y="9" width="13" height="13" rx="2" ry="2" strokeWidth={2} />
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
-                        </svg>
-                      )}
-                    </button>
-                  </div>
-                )}
-                <div className="message-time">
-                  {formatTime(message.timestamp)}
-                </div>
-              </div>
-            ))}
-            <div ref={messagesEndRef} />
-          </div>
-        </div>
-      )}
+      <MessageList
+        messages={messages}
+        copiedMessageId={copiedMessageId}
+        onCopyMessage={copyMessage}
+        onClearMessages={clearMessages}
+        messagesEndRef={messagesEndRef}
+      />
 
-      {/* Prompt Input */}
-      <div className="prompt-section">
-        <label htmlFor="prompt" className="prompt-label">
-          Your Prompt
-        </label>
-        <textarea
-          id="prompt"
-          className="prompt-input"
-          placeholder="Describe what you want to do with the file..."
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          rows={3}
-          disabled={isProcessing}
-        />
-      </div>
+      <PromptInput
+        prompt={prompt}
+        onPromptChange={setPrompt}
+        isProcessing={isProcessing}
+      />
 
-      {/* Video Recording Preview */}
-      {isRecordingVideo && (
-        <div className="video-preview-container">
-          <video ref={videoPreviewRef} className="video-preview" muted playsInline />
-          <div className="recording-overlay">
-            <span className="recording-dot"></span> Recording video...
-          </div>
-        </div>
-      )}
+      <MediaControls
+        isRecordingAudio={isRecordingAudio}
+        isRecordingVideo={isRecordingVideo}
+        isProcessing={isProcessing}
+        videoPreviewRef={videoPreviewRef}
+        onStartAudioRecording={startAudioRecording}
+        onStartVideoRecording={startVideoRecording}
+        onStopRecording={stopRecording}
+      />
 
-      {/* Audio Recording Indicator */}
-      {isRecordingAudio && (
-        <div className="audio-recording-indicator">
-          <span className="recording-dot"></span>
-          <span>Recording audio...</span>
-        </div>
-      )}
-
-      {/* Media Buttons */}
-      <div className="media-buttons">
-        <button
-          className={`media-button ${isRecordingAudio ? 'recording' : ''}`}
-          onClick={isRecordingAudio ? stopRecording : startAudioRecording}
-          disabled={isProcessing || isRecordingVideo}
-          title={isRecordingAudio ? 'Stop recording' : 'Record audio'}
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" className="media-button-icon">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
-          </svg>
-          {isRecordingAudio ? 'Stop' : 'Audio'}
-        </button>
-
-        <button
-          className={`media-button ${isRecordingVideo ? 'recording' : ''}`}
-          onClick={isRecordingVideo ? stopRecording : startVideoRecording}
-          disabled={isProcessing || isRecordingAudio}
-          title={isRecordingVideo ? 'Stop recording' : 'Record video'}
-        >
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" className="media-button-icon">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
-          </svg>
-          {isRecordingVideo ? 'Stop' : 'Video'}
-        </button>
-      </div>
-
-      {/* File Upload Dropzone */}
       {!attachedFile && !isRecording && (
-        <div
-          className={`file-uploader-dropzone ${isDragging ? 'dragging' : ''} ${isProcessing ? 'disabled' : ''}`}
-          onDragEnter={handleDragEnter}
-          onDragOver={handleDragOver}
-          onDragLeave={handleDragLeave}
-          onDrop={handleDrop}
-          onClick={isProcessing ? undefined : handleClick}
-          role="button"
-          tabIndex={isProcessing ? -1 : 0}
-          aria-label="Upload file"
-        >
-          <input
-            ref={fileInputRef}
-            type="file"
-            onChange={handleFileInputChange}
-            className="file-input-hidden"
-            aria-hidden="true"
-            disabled={isProcessing}
-          />
-
-          <div className="dropzone-content">
-            <svg className="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
-            </svg>
-
-            <h3 className="dropzone-title">
-              {isDragging ? 'Drop file here' : 'Upload a file (optional)'}
-            </h3>
-
-            <p className="dropzone-description">
-              Tap to browse or drag and drop a file here
-            </p>
-          </div>
-        </div>
+        <FileDropzone
+          isProcessing={isProcessing}
+          onFilesSelected={handleFilesSelected}
+        />
       )}
 
-      {/* Attached File */}
       {attachedFile && (
-        <div className="attached-file-section">
-          <div className="file-card">
-            <button
-              className="remove-file-button"
-              onClick={(e) => {
-                e.stopPropagation();
-                removeFile();
-              }}
-              disabled={isProcessing}
-              aria-label={`Remove ${attachedFile.file.name}`}
-            >
-              ×
-            </button>
-
-            {attachedFile.preview && attachedFile.file.type.startsWith('image/') ? (
-              <div className="file-preview">
-                <img src={attachedFile.preview} alt={attachedFile.file.name} />
-              </div>
-            ) : attachedFile.preview && attachedFile.file.type.startsWith('audio/') ? (
-              <div className="file-preview-media">
-                <audio src={attachedFile.preview} controls />
-              </div>
-            ) : attachedFile.preview && attachedFile.file.type.startsWith('video/') ? (
-              <div className="file-preview-media">
-                <video src={attachedFile.preview} controls className="video-thumbnail" />
-              </div>
-            ) : (
-              <div className="file-icon">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                </svg>
-              </div>
-            )}
-
-            <div className="file-info">
-              <p className="file-name" title={attachedFile.file.name}>
-                {attachedFile.file.name}
-              </p>
-              <p className="file-size">
-                {formatFileSize(attachedFile.file.size)}
-              </p>
-            </div>
-          </div>
-        </div>
+        <AttachedFileCard
+          file={attachedFile}
+          isProcessing={isProcessing}
+          onRemove={removeFile}
+        />
       )}
 
-      {/* Submit Button */}
       <button
         className="upload-button"
         onClick={handleUpload}
