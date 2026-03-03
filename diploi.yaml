@@ -1,18 +1,24 @@
-# This file is used to build the infrastructure for a deployment.
-# After editing something here, apply the changes on the Diploi dashboard.
-# For more information, see https://diploi.com/yaml
-
 diploiVersion: v1.0
+type: starter
+name: File2AI App
+description: A powerful AI-driven app that analyzes uploaded files and extracts key information. Compatible with image, video, and audio formats.
+previewImageUrls: [preview-1.jpg, preview-2.jpg]
 components:
   - name: React + Vite
     identifier: react-vite
-    package: https://github.com/diploi/component-react-vite#v19.1.1
+    folder: /
+    package: https://github.com/diploi/component-react-vite#v19.2.4-ports
+    prebuildImage: public.ecr.aws/p8t2q7f4/diploi/starter-file2ai/react:[tag]
     env:
       include:
         - fastapi.APP_ENDPOINT:VITE_API_ROOT_ENDPOINT
+        - name: __VITE_RUNTIME_BUILD
+          value: true
   - name: FastAPI
     identifier: fastapi
-    package: https://github.com/diploi/component-fastapi#v0.116.1
+    folder: /
+    package: https://github.com/diploi/component-fastapi#v0.128.0
+    prebuildImage: public.ecr.aws/p8t2q7f4/diploi/starter-file2ai/fastapi:[tag]
     env: 
       include:
         - name: DIPLOI_AI_GATEWAY_URL
