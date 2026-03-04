@@ -16,6 +16,7 @@ body {
 }
 
 .App {
+  margin-top: 15vh;
   width: 300px;
   min-height: 100vh;
   padding-bottom: 2rem;
